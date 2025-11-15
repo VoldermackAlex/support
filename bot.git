@@ -10,7 +10,7 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, ContextTypes, filters
 )
 import asyncio
-BOT_TOKEN = "7639730828:AAFWp5ARoBc-P17nFURj1tcZrt4W6YfBKp8"
+BOT_TOKEN = "8224143737:AAFPGdsRi9sMomLAk3qWbqEwQbvGU_wHGDg"
 ADMIN_ID = 191361082
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 START, CONTACT_REASON, ADMIN_PANEL, CHAT = range(4)
