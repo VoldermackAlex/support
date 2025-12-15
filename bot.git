@@ -1,536 +1,350 @@
-import logging
-import sqlite3
-from datetime import datetime
-import pytz
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, ContextTypes, filters
-)
 import asyncio
-BOT_TOKEN = "8224143737:AAFPGdsRi9sMomLAk3qWbqEwQbvGU_wHGDg"
-ADMIN_ID = 191361082
-MOSCOW_TZ = pytz.timezone("Europe/Moscow")
-START, CONTACT_REASON, ADMIN_PANEL, CHAT = range(4)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-logger = logging.getLogger(__name__)
-def get_db():
-    conn = sqlite3.connect("bot.db", check_same_thread=False)
-    return conn
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        banned INTEGER DEFAULT 0
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS applications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        reason TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS active_chats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER,
-        user_id INTEGER,
-        log_file TEXT,
-        started_at TEXT
-    )""")
-    conn.commit()
-    conn.close()
-def is_banned(uid: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT banned FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and row[0])
-def get_time():
-    aware = datetime.now(MOSCOW_TZ)
-    naive = aware.replace(tzinfo=None)
-    return aware, naive
+import json
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-def get_active_chat(user_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM active_chats WHERE user_id=? OR admin_id=?", (user_id, user_id))
-    chat = cur.fetchone()
-    conn.close()
-    return chat
+BOT_TOKEN = "8445781342:AAE6re6wXQ9BmZqS0dsd4S6amke9irR_SuY"
+ADMIN_IDS = [5981396016]
 
-def get_all_active_chats():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM active_chats")
-    chats = cur.fetchall()
-    conn.close()
-    return chats
+SERVER_INFO = {
+    "name": "Alone",
+    "ip": "----------",
+    "version": "1.20.1",
+    "description": "Ванилла с островами."
+}
 
-def set_active_chat(admin_id: int, user_id: int, log_file: str):
-    conn = get_db()
-    cur = conn.cursor()
-    _, naive = get_time()
+DATA_FILE = "bot_data.json"
 
-    cur.execute("DELETE FROM active_chats WHERE admin_id=? OR user_id=?", (admin_id, user_id))
-    cur.execute("INSERT INTO active_chats (admin_id, user_id, log_file, started_at) VALUES (?,?,?,?)",
-                (admin_id, user_id, log_file, naive))
-    conn.commit()
-    conn.close()
-
-def end_active_chat(user_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM active_chats WHERE user_id=? OR admin_id=?", (user_id, user_id))
-    conn.commit()
-    conn.close()
-
-async def cleanup_active_chats(context: ContextTypes.DEFAULT_TYPE):
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM active_chats")
-    active_chats = cur.fetchall()
-    conn.close()
-    
-    for chat in active_chats:
-        chat_id, admin_id, user_id, log_file, started_at = chat
-        if log_file:
-            try:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(f"ЧАТ АВТОМАТИЧЕСКИ ЗАВЕРШЕН ПРИ ПЕРЕЗАПУСКЕ БОТА {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n")
-            except Exception as e:
-                logger.error(f"Ошибка записи в лог: {e}")
-
-        try:
-            await context.bot.send_message(user_id, "🔚 Бот был перезапущен. Чат автоматически завершён. Если у вас остались вопросы, создайте новую заявку.")
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-
-        try:
-            await context.bot.send_message(admin_id, f"🔚 Чат с пользователем {user_id} был автоматически завершён из-за перезапуска бота.")
-        except Exception as e:
-            logger.error(f"Не удалось уведомить админа {admin_id}: {e}")
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM active_chats")
-    conn.commit()
-    conn.close()
-    
-    logger.info(f"Завершено {len(active_chats)} активных чатов при перезапуске бота")
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    active_chat = get_active_chat(user.id)
-    if active_chat:
-        context.chat_data["active_chat"] = active_chat[2] if user.id == ADMIN_ID else ADMIN_ID
-        context.user_data["log_file"] = active_chat[3]
-        
-        if user.id == ADMIN_ID:
-            kb = [
-                [InlineKeyboardButton("🔚 Завершить чат", callback_data="end_chat")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_start")]
-            ]
-            if update.message:
-                await update.message.reply_text("💬 У вас активный диалог. Продолжайте общение.", reply_markup=InlineKeyboardMarkup(kb))
-            else:
-                await update.callback_query.edit_message_text("💬 У вас активный диалог. Продолжайте общение.", reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_start")]]
-            if update.message:
-                await update.message.reply_text("💬 У вас активный диалог с администратором. Продолжайте общение.", reply_markup=InlineKeyboardMarkup(kb))
-            else:
-                await update.callback_query.edit_message_text("💬 У вас активный диалог с администратором. Продолжайте общение.", reply_markup=InlineKeyboardMarkup(kb))
-        return CHAT
-    
-    if is_banned(user.id):
-        if update.message:
-            await update.message.reply_text("🚫 Вы заблокированы.")
-        else:
-            await update.callback_query.edit_message_text("🚫 Вы заблокированы.")
-        return ConversationHandler.END
-    
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (user.id, user.username))
-    conn.commit()
-    conn.close()
-
-    kb = [[InlineKeyboardButton("📞 Связаться", callback_data="contact")]]
-    if user.id == ADMIN_ID:
-        kb.append([InlineKeyboardButton("👨‍💻 Админ-панель", callback_data="admin_panel")])
-    
-    if update.message:
-        await update.message.reply_text("Добро пожаловать! Выберите действие:", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.callback_query.edit_message_text("Добро пожаловать! Выберите действие:", reply_markup=InlineKeyboardMarkup(kb))
-    
-    return START
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    kb = [[InlineKeyboardButton("❌ Отменить", callback_data="back_start")]]
-    await query.edit_message_text(
-        "Напишите причину обращения:", 
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    return CONTACT_REASON
-
-async def handle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    reason = update.message.text
-    
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 Вы заблокированы.")
-        return START
-    _, naive = get_time()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO applications (user_id, reason, created_at) VALUES (?,?,?)",
-                (user.id, reason, naive))
-    conn.commit()
-    conn.close()
-    kb = [
-        [
-            InlineKeyboardButton("✅ Принять", callback_data=f"accept_{user.id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user.id}")
-        ],
-        [InlineKeyboardButton("🚫 Забанить", callback_data=f"ban_{user.id}")]
-    ]
-    await context.bot.send_message(
-        ADMIN_ID,
-        f"📨 Новая заявка от @{user.username or 'без username'} (ID: {user.id})\n\nПричина: {reason}",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    
-    await update.message.reply_text("✅ Ваша заявка отправлена.")
-    return await start(update, context)
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    kb = [
-        [InlineKeyboardButton("📄 Все заявки", callback_data="all_apps")],
-        [InlineKeyboardButton("💬 Активные чаты", callback_data="active_chats")],
-        [InlineKeyboardButton("🚫 Список забаненных", callback_data="ban_list")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_start")]
-    ]
-    await query.edit_message_text("👨‍💻 Админ-панель", reply_markup=InlineKeyboardMarkup(kb))
-    return ADMIN_PANEL
-async def handle_application_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if any(data.startswith(prefix) for prefix in ["accept_", "reject_", "ban_", "unban_"]):
-        try:
-            parts = data.split('_')
-            if len(parts) < 2:
-                return ADMIN_PANEL
-            action = parts[0]
-            uid_str = parts[1]
-            if not uid_str.isdigit():
-                return ADMIN_PANEL
-                
-            uid = int(uid_str)
-            
-        except (ValueError, IndexError):
-            logger.error(f"Invalid callback data: {data}")
-            return ADMIN_PANEL
-        
-        conn = get_db()
-        cur = conn.cursor()
-
-        if action == "accept":
-            existing_chat = get_active_chat(ADMIN_ID)
-            if existing_chat:
-                await query.edit_message_text("❌ У вас уже есть активный чат. Завершите его перед началом нового.")
-                conn.close()
-                return ADMIN_PANEL
-            cur.execute("UPDATE applications SET status='accepted' WHERE user_id=? AND status='pending'", (uid,))
-            conn.commit()
-
-            filename = f"chat_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-
-            set_active_chat(ADMIN_ID, uid, filename)
-
-            context.chat_data["active_chat"] = uid
-            context.user_data["log_file"] = filename
-            
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"ЧАТ НАЧАТ {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n")
-            
-            await context.bot.send_message(uid, "✅ Администратор принял вашу заявку и начал диалог. Можете писать сообщения!")
-            
-            kb = [
-                [InlineKeyboardButton("🔚 Завершить чат", callback_data="end_chat")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]
-            ]
-            await context.bot.send_message(
-                ADMIN_ID, 
-                f"💬 Диалог с пользователем (ID: {uid}) начат. Можете писать сообщения!", 
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            
-            await query.edit_message_text("✅ Диалог начат. Можете писать сообщения пользователю.")
-            conn.close()
-            return CHAT
-
-        elif action == "reject":
-            cur.execute("UPDATE applications SET status='rejected' WHERE user_id=? AND status='pending'", (uid,))
-            conn.commit()
-            await context.bot.send_message(uid, "❌ Ваша заявка отклонена.")
-            
-            kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]
-            await query.edit_message_text("❌ Заявка отклонена.", reply_markup=InlineKeyboardMarkup(kb))
-            conn.close()
-            return ADMIN_PANEL
-
-        elif action == "ban":
-            cur.execute("UPDATE users SET banned=1 WHERE user_id=?", (uid,))
-            conn.commit()
-            await context.bot.send_message(uid, "🚫 Вы заблокированы администратором.")
-            
-            kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]
-            await query.edit_message_text("✅ Пользователь заблокирован.", reply_markup=InlineKeyboardMarkup(kb))
-            conn.close()
-            return ADMIN_PANEL
-
-        elif action == "unban":
-            cur.execute("UPDATE users SET banned=0 WHERE user_id=?", (uid,))
-            conn.commit()
-            
-            kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]
-            await query.edit_message_text("✅ Пользователь разбанен.", reply_markup=InlineKeyboardMarkup(kb))
-            conn.close()
-            return ADMIN_PANEL
-    
-    return ADMIN_PANEL
-async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    active_chat = get_active_chat(ADMIN_ID)
-    if active_chat:
-        user_id = active_chat[2]
-        log_file = active_chat[3]
-        
-        if log_file:
-            try:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(f"ЧАТ ЗАВЕРШЕН {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n")
-            except:
-                pass
-        try:
-            await context.bot.send_message(user_id, "🔚 Администратор завершил диалог. Если у вас есть новые вопросы, создайте новую заявку.")
-        except:
-            pass
-        end_active_chat(ADMIN_ID)
-    context.chat_data.pop("active_chat", None)
-    context.user_data.pop("log_file", None)
-    
-    await query.edit_message_text("✅ Диалог завершён.")
-    return await admin_panel(update, context)
-async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.message
-    active_chat_data = get_active_chat(user_id)
-    if not active_chat_data:
-        await start(update, context)
-        return START
-    admin_id = active_chat_data[1]
-    user_id_in_chat = active_chat_data[2]
-    log_file = active_chat_data[3]
-    if log_file and message.text:
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                username = update.effective_user.username or f"ID{user_id}"
-                f.write(f"{datetime.now().strftime('%H:%M:%S')} {username}: {message.text}\n")
-        except Exception as e:
-            logger.error(f"Ошибка записи в лог: {e}")
+def load_data():
     try:
-        if user_id == admin_id:
-            if message.text:
-                await context.bot.send_message(user_id_in_chat, f"👨‍💻 Админ: {message.text}")
-            else:
-                await context.bot.copy_message(user_id_in_chat, admin_id, message.message_id)
-        else:
-            if message.text:
-                await context.bot.send_message(admin_id, f"👤 Пользователь: {message.text}")
-            else:
-                await context.bot.copy_message(admin_id, user_id, message.message_id)
-    except Exception as e:
-        logger.error(f"Ошибка пересылки сообщения: {e}")
-        if user_id == admin_id:
-            await update.message.reply_text("❌ Не удалось отправить сообщение. Пользователь заблокировал бота?")
-    return CHAT
-async def all_applications(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT a.id, a.user_id, u.username, a.reason, a.status, a.created_at 
-        FROM applications a 
-        LEFT JOIN users u ON a.user_id = u.user_id 
-        ORDER BY a.created_at DESC LIMIT 10
-    """)
-    rows = cur.fetchall()
-    conn.close()
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"applications": {}, "rejected_applications": {}, "app_counter": 0}
+
+def save_data(data):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+data_storage = load_data()
+applications = data_storage.get("applications", {})
+rejected_applications = {int(k): datetime.fromisoformat(v) for k, v in data_storage.get("rejected_applications", {}).items()}
+app_counter = data_storage.get("app_counter", 0)
+
+class ApplicationForm(StatesGroup):
+    waiting_for_application = State()
+    waiting_for_admin_decision = State()
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+def get_main_menu():
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(
+        InlineKeyboardButton(text="👥 Персонал", callback_data="staff"),
+        InlineKeyboardButton(text="ℹ️ Информация", callback_data="info")
+    )
+    return keyboard.adjust(2).as_markup()
+
+def get_back_button():
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main"))
+    return keyboard.as_markup()
+
+def get_staff_menu():
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text="📝 Подать заявку", callback_data="apply"))
+    keyboard.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main"))
+    return keyboard.as_markup()
+
+def get_cancel_button():
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_application"))
+    return keyboard.as_markup()
+
+def get_accept_reject_buttons(app_id):
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{app_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{app_id}")
+    )
+    keyboard.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back_to_main"))
+    return keyboard.as_markup()
+
+async def delete_message_safely(chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+@dp.message(CommandStart())
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    msg = await message.answer("Добро пожаловать! Выберите действие:", reply_markup=get_main_menu())
+    await state.update_data(last_msg_id=msg.message_id)
+
+@dp.callback_query(lambda c: c.data == "info")
+async def show_info(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(callback_query.from_user.id, last_msg_id)
     
-    if not rows:
-        await query.edit_message_text("📭 Нет заявок.")
-        return ADMIN_PANEL
-    text = "📄 Последние 10 заявок:\n\n"
-    for app_id, user_id, username, reason, status, created_at in rows:
-        status_icon = "🟢" if status == "accepted" else "🔴" if status == "rejected" else "🟡"
-        text += f"{status_icon} #{app_id} - @{username or 'no_username'} (ID: {user_id})\n"
-        text += f"📝 {reason[:50]}{'...' if len(reason) > 50 else ''}\n"
-        text += f"🕐 {created_at}\n\n"
-    kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    return ADMIN_PANEL
-async def active_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    info_text = f"""
+🎮 Название: {SERVER_INFO['name']}
+🌐 IP: {SERVER_INFO['ip']}
+📦 Версия: {SERVER_INFO['version']}
+📝 Описание: {SERVER_INFO['description']}
+    """.strip()
     
-    active_chats = get_all_active_chats()
-    if not active_chats:
-        await query.edit_message_text("💬 Нет активных чатов.")
-        return ADMIN_PANEL
-    text = "💬 Активные чаты:\n\n"
-    kb = []
-    for chat in active_chats:
-        chat_id, admin_id, user_id, log_file, started_at = chat
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT username FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        conn.close()
-        username = row[0] if row else "нет username"
-        
-        text += f"👤 @{username} (ID: {user_id})\n"
-        text += f"🕐 Начат: {started_at}\n"
-        text += "─" * 20 + "\n"
-        kb.append([InlineKeyboardButton(f"💬 Чат с @{username}", callback_data=f"accept_{user_id}")])
-    kb.append([InlineKeyboardButton("🔚 Завершить все чаты", callback_data="end_all_chats")])
-    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    return ADMIN_PANEL
-async def end_all_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    active_chats = get_all_active_chats()
-    for chat in active_chats:
-        chat_id, admin_id, user_id, log_file, started_at = chat
-        if log_file:
-            try:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(f"ЧАТ ЗАВЕРШЕН {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n")
-            except:
-                pass
+    msg = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text=info_text,
+        reply_markup=get_back_button()
+    )
+    await state.update_data(last_msg_id=msg.message_id)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "staff")
+async def show_staff(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(callback_query.from_user.id, last_msg_id)
+    
+    staff_text = """
+📋 Список персонала:
+• Владелец: amphezy
+• Куратор: voldermack
+• Модератор: VanyaZXCdemon
+    """.strip()
+    
+    msg = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text=staff_text,
+        reply_markup=get_staff_menu()
+    )
+    await state.update_data(last_msg_id=msg.message_id)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "apply")
+async def start_application(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    if str(user_id) in rejected_applications:
+        rejection_time = rejected_applications[str(user_id)]
+        cooldown_end = rejection_time + timedelta(days=7)
+        if datetime.now() < cooldown_end:
+            remaining = cooldown_end - datetime.now()
+            days_left = max(remaining.days, 0)
+            msg = await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Вы не можете подать заявку. Подождите {days_left} дней после отклонения.",
+                reply_markup=get_back_button()
+            )
+            await state.update_data(last_msg_id=msg.message_id)
+            await callback_query.answer()
+            return
+    
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(callback_query.from_user.id, last_msg_id)
+    
+    req_text = """
+📋 Требования к кандидату:
+• Наличие микрофона
+• Наличие Discord
+• Знание как проводить проверку на читы
+• Опыт работы модератором (желательно)
+• Умение общаться с игроками корректно
+    """.strip()
+    
+    form_text = """
+📝 Форма подачи заявки:
+• Ваш ник
+• Ваше имя
+• Ваш возраст
+• Ваши знания правил сервера
+• Почему хотите работать у нас?
+    """.strip()
+    
+    full_text = f"{req_text}\n\n{form_text}\n\n💬 Отправьте заполненную форму одним сообщением."
+    
+    msg = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text=full_text,
+        reply_markup=get_cancel_button()
+    )
+    await state.set_state(ApplicationForm.waiting_for_application)
+    await state.update_data(last_msg_id=msg.message_id)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "cancel_application")
+async def cancel_application(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(callback_query.from_user.id, last_msg_id)
+    
+    msg = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text="📋 Подача заявки отменена.",
+        reply_markup=get_main_menu()
+    )
+    await state.clear()
+    await state.update_data(last_msg_id=msg.message_id)
+    await callback_query.answer()
+@dp.message(ApplicationForm.waiting_for_application)
+async def receive_application(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if str(user_id) in rejected_applications:
+        rejection_time = rejected_applications[str(user_id)]
+        cooldown_end = rejection_time + timedelta(days=7)
+        if datetime.now() < cooldown_end:
+            remaining = cooldown_end - datetime.now()
+            days_left = max(remaining.days, 0)
+            msg = await message.answer(f"❌ Вы не можете подать заявку. Подождите {days_left} дней после отклонения.")
+            await state.update_data(last_msg_id=msg.message_id)
+            return
+    global app_counter
+    app_counter += 1
+    app_id = app_counter
+    
+    user_data = message.text
+    username = message.from_user.username or "Без имени"
+    
+    applications[app_id] = {
+        "user_id": user_id,
+        "username": username,
+        "data": user_data,
+        "status": "pending"
+    }
+    
+    save_data({
+        "applications": applications,
+        "rejected_applications": {str(k): v.isoformat() for k, v in rejected_applications.items()},
+        "app_counter": app_counter
+    })
+    
+    await delete_message_safely(message.chat.id, message.message_id)
+    
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(message.chat.id, last_msg_id)
+    
+    msg = await message.answer(f"✅ Ваша заявка №{app_id} принята. Ожидайте рассмотрения.")
+    await state.update_data(last_msg_id=msg.message_id)
+    
+    admin_text = f"""
+📥 Новая заявка №{app_id} от @{username} (ID: {user_id}):
+{user_data}
+    """.strip()
+    
+    for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(user_id, "🔚 Все чаты были завершены администратором.")
-        except:
+            await bot.send_message(admin_id, admin_text, reply_markup=get_accept_reject_buttons(app_id))
+        except Exception:
             pass
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM active_chats")
-    conn.commit()
-    conn.close()
-    await query.edit_message_text("✅ Все активные чаты завершены.")
-    return await admin_panel(update, context)
-async def show_ban_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username FROM users WHERE banned=1")
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        await query.edit_message_text("🚫 Список забаненных пуст.")
-        return ADMIN_PANEL
-    text = "🚫 Заблокированные пользователи:\n\n"
-    kb = []
-    for uid, username in rows:
-        display_name = f"@{username}" if username else f"ID: {uid}"
-        text += f"• {display_name}\n"
-        kb.append([InlineKeyboardButton(f"🔓 Разбанить {display_name}", callback_data=f"unban_{uid}")])
-    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    return ADMIN_PANEL
-async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    kb = [[InlineKeyboardButton("📞 Связаться", callback_data="contact")]]
-    if user.id == ADMIN_ID:
-        kb.append([InlineKeyboardButton("👨‍💻 Админ-панель", callback_data="admin_panel")])
-    await query.edit_message_text(
-        "Добро пожаловать! Выберите действие:", 
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    return START
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    active_chat = get_active_chat(user.id)
-    if active_chat:
-        end_active_chat(user.id)
-    await update.message.reply_text("❌ Действие отменено.")
-    return await start(update, context)
-async def handle_unhandled_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+
+@dp.callback_query(lambda c: c.data.startswith("accept_"))
+async def accept_application(callback_query: types.CallbackQuery, state: FSMContext):
+    app_id = int(callback_query.data.split("_")[1])
     
-    active_chat = get_active_chat(user_id)
-    if active_chat:
-        return await chat_handler(update, context)
-    else:
-        return await start(update, context)
-
-async def post_init(application):
-    await cleanup_active_chats(application.bot_data)
-def main():
-    init_db()
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CallbackQueryHandler(handle_application_action, pattern="^(accept|reject|ban|unban)_[0-9]+$"))
-    application.add_handler(CallbackQueryHandler(end_all_chats, pattern="^end_all_chats$"))
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            START: [
-                CallbackQueryHandler(contact, pattern="^contact$"),
-                CallbackQueryHandler(admin_panel, pattern="^admin_panel$"),
-                CallbackQueryHandler(back_start, pattern="^back_start$")
-            ],
-            CONTACT_REASON: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason),
-                CallbackQueryHandler(back_start, pattern="^back_start$")
-            ],
-            ADMIN_PANEL: [
-                CallbackQueryHandler(all_applications, pattern="^all_apps$"),
-                CallbackQueryHandler(active_chats, pattern="^active_chats$"),
-                CallbackQueryHandler(show_ban_list, pattern="^ban_list$"),
-                CallbackQueryHandler(admin_panel, pattern="^admin_panel$"),
-                CallbackQueryHandler(back_start, pattern="^back_start$"),
-                CallbackQueryHandler(end_chat, pattern="^end_chat$")
-            ],
-            CHAT: [
-                CallbackQueryHandler(end_chat, pattern="^end_chat$"),
-                CallbackQueryHandler(back_start, pattern="^back_start$"),
-                MessageHandler(filters.ALL & ~filters.COMMAND, chat_handler)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
-        allow_reentry=True
+    await callback_query.message.edit_text(
+        f"Введите дату и время для собеседования по заявке №{app_id}.\n📅 Формат: ДД.ММ.ГГГГ ЧЧ:ММ",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back_to_main")]
+        ])
     )
+    
+    await state.set_state(ApplicationForm.waiting_for_admin_decision)
+    await state.update_data(current_app_id=app_id)
+    await callback_query.answer()
 
-    application.add_handler(conv)
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_unhandled_messages))
-    application.run_polling()
-    print("✅ BOT STARTED")
+@dp.message(ApplicationForm.waiting_for_admin_decision)
+async def handle_datetime_input(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    app_id = user_data.get('current_app_id')
+    
+    if app_id and app_id in applications:
+        interview_datetime_str = message.text
+        try:
+            interview_datetime = datetime.strptime(interview_datetime_str, "%d.%m.%Y %H:%M")
+            user_id = applications[app_id]['user_id']
+            
+            success_msg = f"""
+✅ Ваша заявка №{app_id} была одобрена!
+📅 Дата собеседования: {interview_datetime.strftime('%d.%m.%Y в %H:%M')}
+    """.strip()
+            await bot.send_message(user_id, success_msg)
+            
+            applications[app_id]['status'] = 'accepted'
+            await message.answer(f"✅ Заявка №{app_id} одобрена. Собеседование назначено на {interview_datetime_str}.")
+        except ValueError:
+            await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
+    
+    await delete_message_safely(message.chat.id, message.message_id)
+    await state.clear()
+    save_data({
+        "applications": applications,
+        "rejected_applications": {str(k): v.isoformat() for k, v in rejected_applications.items()},
+        "app_counter": app_counter
+    })
+
+@dp.callback_query(lambda c: c.data.startswith("reject_"))
+async def reject_application(callback_query: types.CallbackQuery):
+    app_id = int(callback_query.data.split("_")[1])
+    
+    if app_id in applications:
+        user_id = applications[app_id]["user_id"]
+        try:
+            await bot.send_message(user_id, f"❌ Ваша заявка №{app_id} была отклонена. Вы можете подать её повторно через 7 дней.")
+            rejected_applications[str(user_id)] = datetime.now()
+        except Exception:
+            pass
+        
+        applications[app_id]["status"] = "rejected"
+        
+        await callback_query.message.edit_text(
+            f"❌ Заявка №{app_id} отклонена.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back_to_main")]
+            ])
+        )
+    await callback_query.answer()
+    save_data({
+        "applications": applications,
+        "rejected_applications": {str(k): v.isoformat() for k, v in rejected_applications.items()},
+        "app_counter": app_counter
+    })
+
+@dp.callback_query(lambda c: c.data == "admin_back_to_main")
+async def admin_back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback_query.message.edit_text("📋 Управление заявками завершено.", reply_markup=get_main_menu())
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    last_msg_id = data.get('last_msg_id')
+    if last_msg_id:
+        await delete_message_safely(callback_query.from_user.id, last_msg_id)
+    
+    msg = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text="📋 Выберите действие:",
+        reply_markup=get_main_menu()
+    )
+    await state.clear()
+    await state.update_data(last_msg_id=msg.message_id)
+    await callback_query.answer()
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(dp.start_polling(bot))
